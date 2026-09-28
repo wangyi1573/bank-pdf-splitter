@@ -100,13 +100,8 @@ def _cut_at_line_end(s: str) -> str:
 
 
 def clean_captured(raw: str) -> str:
-    """对正则捕获到的原始文本做收尾清理。"""
-    if not raw:
-        return ''
-    s = _cut_at_line_end(raw)
-    # 若捕获内容里混入了后续字段的标签，则截断到标签之前
-    s = re.split(r'(?:账号|账户|开户行|开户|金额|日期|时间|摘要|用途|附言|币种|状态|流水|凭证|序号)', s, maxsplit=1)[0]
-    return normalize_name(s)
+    """对正则捕获到的原始文本做收尾清理（保留兼容，逻辑见 _clean_party_name）。"""
+    return _clean_party_name(raw)
 
 
 def dedupe_keep_order(items) -> list:
@@ -135,13 +130,13 @@ def _capture_by_labels(text: str, labels, min_len: int = 2, max_len: int = 60) -
         esc = re.escape(label)
         pat_colon = re.compile(esc + r'\s*[：:]\s*([^\r\n：:]{' + str(min_len) + r',' + str(max_len) + r'})')
         for m in pat_colon.finditer(text):
-            v = clean_captured(m.group(1))
-            if len(v) >= min_len:
+            v = _clean_party_name(m.group(1))
+            if len(v) >= min_len and _is_valid_party(v):
                 results.append(v)
         pat_nocolon = re.compile(esc + r'[ \t]*([^ \t\r\n：:0-9]{' + str(min_len) + r',' + str(max_len) + r'})[ \t]*' + _ACCOUNT_RE)
         for m in pat_nocolon.finditer(text):
-            v = clean_captured(m.group(1))
-            if len(v) >= min_len:
+            v = _clean_party_name(m.group(1))
+            if len(v) >= min_len and _is_valid_party(v):
                 results.append(v)
     return dedupe_keep_order(results)
 
@@ -252,13 +247,21 @@ OCR_DPI = 200
 OCR_INSTALL_HINT = (
     '未检测到可用的 OCR 引擎。\n\n'
     '推荐方式（纯 pip 安装，自带中文模型，无需其他软件）：\n'
-    '    pip install rapidocr_onnxruntime\n\n'
+    '    pip install rapidocr_onnxruntime\n'
+    '    （Python 3.13 及以上不支持 rapidocr_onnxruntime，请改用：\n'
+    '      pip install rapidocr onnxruntime）\n\n'
     '备选方式：安装 Tesseract OCR（需含中文包 chi_sim）：\n'
     '    https://github.com/UB-Mannheim/tesseract/wiki'
 )
 
+
+def _ocr_fail_hint(reason: str = '') -> str:
+    """组装 OCR 不可用提示，附带实际加载失败原因，便于定位。"""
+    return OCR_INSTALL_HINT + (f'\n\n加载失败详情：{reason}' if reason else '')
+
+
 # 引擎懒加载缓存
-_OCR_CACHE = {'probed': False, 'engine': None}
+_OCR_CACHE = {'probed': False, 'engine': None, 'reason': ''}
 
 
 def ocr_probe():
@@ -292,22 +295,26 @@ def get_ocr_engine():
     """
     if _OCR_CACHE['probed']:
         if _OCR_CACHE['engine'] is None:
-            raise OCRUnavailableError(OCR_INSTALL_HINT)
+            raise OCRUnavailableError(_ocr_fail_hint(_OCR_CACHE.get('reason', '')))
         return _OCR_CACHE['engine']
 
     kind = None
     engine = None
-    # RapidOCR（两种包名兼容）
+    reason = ''
+    # RapidOCR（两种包名兼容：旧 rapidocr_onnxruntime / 新 rapidocr 3.x）
     for mod_name in ('rapidocr_onnxruntime', 'rapidocr'):
         try:
             mod = __import__(mod_name, fromlist=['RapidOCR'])
-            engine = mod.RapidOCR()
-            kind = 'rapidocr'
-            break
         except ImportError:
             continue
-        except Exception:
-            # 包存在但加载失败（如缺 onnxruntime），继续尝试下一个
+        try:
+            engine = mod.RapidOCR()
+            kind = 'rapidocr'
+            reason = ''
+            break
+        except Exception as exc:
+            # 包已安装但后端缺失（如新版 rapidocr 未装推理引擎），留原因供排查
+            reason = f'{mod_name} 已安装但初始化失败：{exc.__class__.__name__}: {exc}'
             continue
     # Tesseract 兜底
     if kind is None:
@@ -316,13 +323,15 @@ def get_ocr_engine():
             pytesseract.get_tesseract_version()
             engine = pytesseract
             kind = 'tesseract'
+            reason = ''
         except Exception:
             engine = None
 
     _OCR_CACHE['probed'] = True
+    _OCR_CACHE['reason'] = reason
     _OCR_CACHE['engine'] = (kind, engine) if kind else None
     if _OCR_CACHE['engine'] is None:
-        raise OCRUnavailableError(OCR_INSTALL_HINT)
+        raise OCRUnavailableError(_ocr_fail_hint(reason))
     return _OCR_CACHE['engine']
 
 
@@ -332,18 +341,44 @@ def _run_ocr(kind, engine, pix) -> str:
 
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
     if pix.n == 4:
-        from PIL import Image
         arr = np.ascontiguousarray(arr[:, :, :3])
 
     if kind == 'rapidocr':
-        result, _ = engine(arr)
-        if not result:
-            return ''
-        return '\n'.join(str(item[1]) for item in result)
+        return _rapidocr_text(engine, arr)
     # tesseract
     from PIL import Image
     img = Image.fromarray(arr)
     return engine.image_to_string(img, lang='chi_sim+eng')
+
+
+def _rapidocr_text(engine, arr) -> str:
+    """解析 RapidOCR 识别结果，兼容新旧两代 API。
+
+    旧版 rapidocr_onnxruntime：engine(arr) -> (result, elapse)，
+        result 形如 [[box, text, score], ...]；
+    新版 rapidocr 3.x：engine(arr) -> RapidOCROutput 对象，文本在 .txts，
+        该包仅是统一外壳，需另装推理后端（onnxruntime 等）。
+    """
+    res = engine(arr)
+
+    # 新版统一包：结果对象带 txts
+    txts = getattr(res, 'txts', None)
+    if txts is not None:
+        return '\n'.join(str(t) for t in txts if t)
+
+    # 旧版：元组 (result, elapse)
+    rows = res[0] if isinstance(res, (tuple, list)) and len(res) == 2 else res
+    if not rows:
+        return ''
+    lines = []
+    for item in rows:
+        try:
+            text = str(item[1])
+        except (TypeError, IndexError, KeyError):
+            continue
+        if text:
+            lines.append(text)
+    return '\n'.join(lines)
 
 
 def ocr_pages(pdf_path: str, indices, dpi: int = OCR_DPI, progress=None) -> dict:
@@ -548,9 +583,37 @@ _POS_FIELD_LABELS = {
 }
 _ROW_TOL = 3.5      # 同一行的 y 容差
 _LABEL_GAP = 26.0   # 拆字标签内部的最大间距
-_VALUE_GAP = 60.0   # 标签到值、值内部词间的最大间距
+_VALUE_GAP = 60.0   # 值内部相邻词之间的最大间距
+# 标签到首个值词的间距：值在固定文本框里居中排版，短名（如个人姓名「张三」）
+# 比长公司名更靠右，实测间距可达 90pt+，阈值过小会把个人名整条丢掉。
+_LABEL_VALUE_GAP = 130.0
 _CJK_RE = re.compile(r'[\u4e00-\u9fa5]{1,6}')
 _NUM_RE = re.compile(r'^[\d*.,¥￥\-]+$')
+
+# 竖排单字列（回单左侧竖排的「本行账户」「对方账户」）判据
+_VERT_MIN_CHARS = 3     # 至少包含的单字数
+_VERT_MIN_SPAN = 12.0   # 纵向跨度下限（pt）
+_VERT_X_TOL = 2.0       # 同一列的 x 容差（pt）
+
+# 字段标签残字：一旦出现在值里说明标签被值吞了，需截断
+_LABEL_RESIDUE = ['户名', '账号', '账户', '开户行', '开户', '客户名称', '对方机构',
+                  '本方机构', '交易机构', '金额', '大写', '小写', '日期', '时间',
+                  '摘要', '备注', '用途', '附言', '凭证', '流水号', '签章',
+                  '币种', '状态', '序号']
+
+# 明显不是主体名称的字段词
+_NON_NAME_WORDS = {
+    '银行签章', '交易机构', '对方机构', '本方机构', '户名', '账号', '摘要', '备注',
+    '日期', '时间', '流水号', '凭证', '人民币', '电子银行平台', '跨行转账',
+    '工资', '打印日期', '金额', '大写金额', '小写金额',
+}
+
+# 回单侧边的竖排标签。值里出现它的前缀（如「对」「对方」「本行」）说明
+# 竖排文字被吞进了值，需在确认粘连后剥掉尾部残字。
+_VERT_LABELS = ('本行账户', '对方账户')
+_VERT_PREFIXES = sorted({v[:n] for v in _VERT_LABELS for n in range(1, len(v) + 1)},
+                        key=len, reverse=True)
+
 
 
 def _group_rows(words):
@@ -567,6 +630,88 @@ def _group_rows(words):
     for r in rows:
         r['items'].sort(key=lambda t: t[0])
     return rows
+
+
+def _vertical_char_marks(words) -> set:
+    """找出竖排单字列（回单侧边的「本行账户」「对方账户」）所在的 x 位置。
+
+    这类单字与横向文字落在同一 y 行，若不排除会被当成值的一部分，
+    实测会产出「XX公司对户名YY公司」这种粘连名称。
+    返回 x 位置集合（四舍五入到 0.1pt）。
+    """
+    singles = []
+    for w in words:
+        t = (w[4] or '').strip()
+        if len(t) == 1 and _CJK_RE.fullmatch(t):
+            singles.append((w[0], w[1]))
+    singles.sort()
+    marks = set()
+    cluster = []
+    for x, y in singles:
+        if cluster and x - cluster[-1][0] > _VERT_X_TOL:
+            _mark_vertical(cluster, marks)
+            cluster = []
+        cluster.append((x, y))
+    _mark_vertical(cluster, marks)
+    return marks
+
+
+def _mark_vertical(cluster, marks):
+    """单字簇若纵向铺开则认定为竖排文字，记录其 x。"""
+    if len(cluster) < _VERT_MIN_CHARS:
+        return
+    ys = [y for _x, y in cluster]
+    if max(ys) - min(ys) < _VERT_MIN_SPAN:
+        return
+    marks.add(round(sum(x for x, _y in cluster) / len(cluster), 1))
+
+
+def _is_vertical(item, marks) -> bool:
+    """该词是否属于竖排单字列（不应作为字段值）。"""
+    if not marks:
+        return False
+    x0, _x1, t = item
+    if len(t.strip()) != 1:
+        return False
+    return any(abs(x0 - m) <= _VERT_X_TOL for m in marks)
+
+
+def _clean_party_name(raw: str) -> str:
+    """清洗主体名称，剥掉被吞进来的字段标签残字。
+
+    位置解析在个别版式下会把标签粘进值里，如「XX公司对户名YY公司」：
+    先按标签词截断，再剥掉尾部残留的竖排标签前缀（「对」「对方」「本行」…）。
+    只在确认发生粘连（找到标签词）后才剥离，避免误伤「某某本」这类正常名称；
+    整串就是标签时判为空。
+    """
+    s = normalize_name(raw)
+    if not s:
+        return ''
+    for word in _LABEL_RESIDUE:
+        idx = s.find(word)
+        if idx < 0:
+            continue
+        if idx == 0:
+            return ''
+        s = s[:idx]
+        while s:
+            frag = next((v for v in _VERT_PREFIXES if s.endswith(v)), None)
+            if not frag:
+                break
+            s = s[:-len(frag)]
+        return normalize_name(s)
+    return s
+
+
+def _is_valid_party(s: str) -> bool:
+    """主体名称有效性：长度合理、含中文、且不是字段词/纯数字。"""
+    if not s or not (2 <= len(s) <= 40):
+        return False
+    if not re.search(r'[\u4e00-\u9fa5]', s):
+        return False
+    if _NUM_RE.fullmatch(s):
+        return False
+    return s not in _NON_NAME_WORDS
 
 
 def _match_label_at(items, i, label):
@@ -594,11 +739,12 @@ def _match_label_at(items, i, label):
     return None
 
 
-def _collect_value(items, j, stop_labels):
+def _collect_value(items, j, stop_labels, vert_marks=None, labels_by_len=None):
     """从 items[j] 起收集值 token：间距小、非标签、非长数字。返回 (文本, 结束下标)。"""
     parts = []
     prev_x1 = None
     k = j
+    stop_sorted = labels_by_len if labels_by_len is not None else sorted(stop_labels, key=len, reverse=True)
     while k < len(items):
         x0, x1, t = items[k]
         core = t.strip()
@@ -610,6 +756,12 @@ def _collect_value(items, j, stop_labels):
             k += 1
             continue
         if any(core.rstrip('：:') == lb for lb in stop_labels):
+            break
+        # 拆字标签（如「户 名」两个词）也要能识别为标签边界，否则会被value吞掉
+        if any(_match_label_at(items, k, lb) for lb in stop_sorted):
+            break
+        # 竖排单字（「对方账户」逐字竖排）不是值
+        if _is_vertical(items[k], vert_marks):
             break
         if prev_x1 is not None and x0 - prev_x1 > _VALUE_GAP:
             break
@@ -626,15 +778,16 @@ def positional_parse(words) -> dict:
     """按词坐标解析分离式标签版式，返回与 parse_page_text 同构的 dict。"""
     parties, fields = [], {'date': '', 'amount': '', 'summary': '', 'upper_amount': ''}
     all_labels = set(_POS_PARTY_LABELS) | {lb for v in _POS_FIELD_LABELS.values() for lb in v}
+    labels_by_len = sorted(all_labels, key=len, reverse=True)
     try:
         rows = _group_rows(words)
+        vert_marks = _vertical_char_marks(words)
     except Exception:
-        rows = []
+        rows, vert_marks = [], set()
     for row in rows:
         items = row['items']
         i = 0
         while i < len(items):
-            labels_by_len = sorted(all_labels, key=len, reverse=True)
             matched = None  # (label, consumed, end_x, value, j2)
             # 形态①：单 token「标签：值」（如「摘要：工程款」被合成一个词）
             core = items[i][2].strip()
@@ -653,8 +806,9 @@ def positional_parse(words) -> dict:
                     if m:
                         consumed, end_x = m
                         j = i + consumed
-                        if j < len(items) and items[j][0] - end_x <= _VALUE_GAP:
-                            value, j2 = _collect_value(items, j, all_labels)
+                        if j < len(items) and items[j][0] - end_x <= _LABEL_VALUE_GAP:
+                            value, j2 = _collect_value(items, j, all_labels,
+                                                       vert_marks, labels_by_len)
                         else:
                             value, j2 = '', j
                         matched = (label, consumed, end_x, value, j2)
@@ -665,8 +819,8 @@ def positional_parse(words) -> dict:
             label, consumed, end_x, value, j2 = matched
             if value:
                 if label in _POS_PARTY_LABELS:
-                    v = normalize_name(value)
-                    if len(v) >= 2 and not _NUM_RE.fullmatch(v):
+                    v = _clean_party_name(value)
+                    if _is_valid_party(v):
                         parties.append(v)
                 elif label in _POS_FIELD_LABELS['date']:
                     fields['date'] = fields['date'] or extract_date(value)
@@ -805,6 +959,8 @@ def find_matches(pages: list, queries, loose: bool = True) -> list:
     每项形如 {'page': 页面dict, 'query': 查询词, 'party': 命中主体}。
     一页可被多个查询词分别命中（由调用方决定如何去重导出）。
     """
+    if isinstance(queries, str):  # 容错：误传单个字符串时不当成字符序列遍历
+        queries = [queries]
     out = []
     for q in queries:
         if not q or not q.strip():
