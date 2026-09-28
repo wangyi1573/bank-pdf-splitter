@@ -11,6 +11,7 @@ venv/
 selftest.py
 gui_smoketest.py
 screenshot_demo.py
+page_token_guitest.py
 
 # 运行产物
 selftest_output/

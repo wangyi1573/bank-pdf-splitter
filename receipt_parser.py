@@ -597,6 +597,20 @@ def find_matches(pages: list, queries, loose: bool = True) -> list:
     return out
 
 
+# 页码写法：第3页 / p5 / #7（前缀支持全角大写）
+_PAGE_TOKEN_RE = re.compile(r'^(?:第\s*(\d{1,4})\s*页|[pPｐＰ#＃](\d{1,4})|(\d{1,4})\s*页)$')
+
+
+def parse_page_token(q: str):
+    """把「第3页 / p5 / #7」类页码写法解析为 1 基页码；非页码写法返回 None。"""
+    if not q:
+        return None
+    m = _PAGE_TOKEN_RE.match(q.strip())
+    if not m:
+        return None
+    return int(next(g for g in m.groups() if g))
+
+
 def list_all_parties(pages: list) -> list:
     """汇总所有页面出现的主体名称（去重、按出现次数降序）。"""
     counter = {}

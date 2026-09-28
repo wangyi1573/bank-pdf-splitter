@@ -222,7 +222,7 @@ class App(_AppBase):
         self.ocr_label.pack(side='left', padx=(12, 0))
 
         # ── 客户名称 ──
-        box3 = ttk.LabelFrame(body, text=' 3. 指定客户名称（可多个，用逗号/分号/顿号/换行分隔） ', padding=10)
+        box3 = ttk.LabelFrame(body, text=' 3. 指定客户名称或页码（如 第3页 / p5；多个用逗号/分号/顿号/换行分隔） ', padding=10)
         box3.grid(row=2, column=0, sticky='ew', pady=(10, 0))
         box3.columnconfigure(0, weight=1)
 
@@ -625,7 +625,19 @@ class App(_AppBase):
         self._set_status('正在匹配…')
 
         def work():
-            self._q.put(('preview', (queries, rp.find_matches(self.pages, queries, loose))))
+            results = []
+            page_by_num = {p['page_num']: p for p in self.pages}
+            for q in queries:
+                n = rp.parse_page_token(q)
+                if n is not None:
+                    # 页码写法：直接定位该页，不走名称匹配
+                    p = page_by_num.get(n)
+                    if p:
+                        results.append({'page': p, 'query': q,
+                                        'party': p.get('customer') or '指定页码'})
+                    continue
+                results.extend(rp.find_matches(self.pages, [q], loose))
+            self._q.put(('preview', (queries, results)))
 
         self._run_async(work)
 
@@ -660,6 +672,10 @@ class App(_AppBase):
         detail = '，'.join(f'{k} {v} 页' for k, v in counts.items())
         missing = [q for q in queries if q not in counts]
         tip = f'（未命中：{"、".join(missing)}）' if missing else ''
+        if missing and any(rp.parse_page_token(q) is not None for q in missing):
+            tip += f'（页码超出范围 1~{len(self.pages)}）' if any(
+                rp.parse_page_token(q) is not None and not 1 <= rp.parse_page_token(q) <= len(self.pages)
+                for q in missing) else ''
         self._set_busy(False)
         self._set_status(f'匹配完成：命中 {pages_hit} 页　{detail}　{tip}（双击行可打开源文件）')
         LOG.info('预览: queries=%s hits=%s', queries, counts)
