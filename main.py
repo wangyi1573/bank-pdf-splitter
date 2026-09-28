@@ -238,7 +238,7 @@ class App(_AppBase):
         ttk.Checkbutton(opts, text='合并导出', variable=self.merge_one).pack(side='left', padx=(10, 0))
 
         # 3. 客户名称
-        box3 = ttk.LabelFrame(side, text=' 3. 客户名称或页码（第3页/p5，可多个） ', padding=8)
+        box3 = ttk.LabelFrame(side, text=' 3. 客户名称或页码（企业/个人，第3页/p5，可多个） ', padding=8)
         box3.grid(row=2, column=0, sticky='ew', pady=(8, 0))
         box3.columnconfigure(0, weight=1)
         qrow = ttk.Frame(box3)
@@ -259,11 +259,17 @@ class App(_AppBase):
         ttk.Entry(ch, textvariable=self.filter_text, width=10).pack(side='right')
         ttk.Label(ch, text='筛选:', foreground='#444').pack(side='right')
         self.filter_text.trace_add('write', lambda *_: self._refresh_candidates())
-        self.cand_list = tk.Listbox(cand, selectmode='extended', height=4,
+        self.cand_list = tk.Listbox(cand, selectmode='extended', height=6,
                                     font=(UI_FONT, 9), activestyle='none',
                                     exportselection=False,
                                     selectbackground='#cfe3fb', selectforeground='#123')
         self.cand_list.grid(row=1, column=0, sticky='ew', pady=(2, 0))
+        # 候选可能上千条（一页含收付双方 + 长周期导出），配滚动条与滚轮
+        cand_scroll = ttk.Scrollbar(cand, orient='vertical', command=self.cand_list.yview)
+        cand_scroll.grid(row=1, column=1, sticky='ns', pady=(2, 0))
+        self.cand_list.config(yscrollcommand=cand_scroll.set)
+        self.cand_list.bind('<MouseWheel>',
+                            lambda e: self.cand_list.yview_scroll(-1 * (e.delta // 120), 'units'))
         self.cand_list.bind('<Double-Button-1>', self._on_cand_double_click)
         ttk.Button(cand, text='加入名称框', width=9, command=self._use_selected)\
             .grid(row=2, column=0, sticky='w', pady=(3, 0))

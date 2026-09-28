@@ -1,4 +1,10 @@
-# Python
+# ═══════════════════════════════════════════════════════════════
+# 提交安全策略：宁可错杀，提前屏蔽。
+# 数据文件 / 测试脚本 / 截图默认全部禁止，确需提交的单独放行。
+# （曾误将真实回单推上公开仓库，此文件是第一道闸）
+# ═══════════════════════════════════════════════════════════════
+
+# ── Python ──
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -7,26 +13,48 @@ dist/
 .venv/
 venv/
 
-# 本地测试 / 开发辅助脚本（不上传）
-selftest.py
-gui_smoketest.py
-screenshot_demo.py
-page_token_guitest.py
+# ── 数据文件：银行回单等敏感来源，一律不提交 ──
+*.pdf
+*.PDF
+*.xls
+*.xlsx
+*.csv
+*.doc
+*.docx
+*.zip
+*.7z
+*.rar
 
-# 运行产物
-selftest_output/
+# ── 图片：默认全部屏蔽（截图可能含真实客户数据），白名单放行 ──
+*.png
+*.jpg
+*.jpeg
+*.gif
+!ui_preview.png
+
+# ── 本地测试 / 开发辅助脚本（按名字模式兜底，新脚本自动屏蔽）──
+*test*.py
+*demo*.py
+*screenshot*.py
+check_*.py
+_*
+
+# ── 运行产物 / 临时文件 ──
+*_output/
+output/
+exports/
 *.log
+*.tmp
+*.bak
+*.orig
 
-# IDE / 系统
+# ── 本地文档 / 工单 / 笔记 ──
+SUPPORT_*.md
+*工单*
+task_summary*
+
+# ── IDE / 系统 ──
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-
-# 源 PDF / 本地测试脚本（不上传）
-*.pdf
-split_guitest.py
-page_token_guitest.py
-ui_real_masked.png
-realdata_screenshot.py
-SUPPORT_TICKET.md
