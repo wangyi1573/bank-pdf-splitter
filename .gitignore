@@ -7,6 +7,11 @@ dist/
 .venv/
 venv/
 
+# 本地测试 / 开发辅助脚本（不上传）
+selftest.py
+gui_smoketest.py
+screenshot_demo.py
+
 # 运行产物
 selftest_output/
 *.log
