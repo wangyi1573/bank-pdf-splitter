@@ -4,7 +4,9 @@
 
 用法：python main.py，或直接运行打包后的 exe。
 
-流程：选择/拖入源 PDF → ① 解析回单 → 指定客户名称 → ② 预览匹配 → ③ 导出 PDF。
+布局：左侧功能区（选文件 / 解析 / 客户名匹配 / 导出）+ 右侧 PDF 预览主区。
+预览区支持翻页、缩放，以及「划线拆分」——一页 A4 打印了 2/3 张回单时，
+在预览图上画出分割线，把每张回单裁切为独立的 PDF 页。
 详细设计见 SPEC.md 与代码内注释。
 """
 
@@ -39,15 +41,12 @@ APP_DIR = Path.home() / '.bank_pdf_splitter'
 CONFIG_PATH = APP_DIR / 'config.json'
 LOG_DIR = APP_DIR / 'logs'
 
-# 查询词分隔符
 QUERY_SPLIT_RE = re.compile(r'[,，;；、\n\r\t]+')
 
 UI_FONT = '微软雅黑'
+SIDE_W = 380
+LINE_COLOR = '#e03131'
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 配置 / 日志
-# ─────────────────────────────────────────────────────────────────────────────
 
 def setup_logging() -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -105,10 +104,6 @@ def parse_queries(raw: str) -> list:
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 主窗口
-# ─────────────────────────────────────────────────────────────────────────────
-
 _AppBase = TkinterDnD.Tk if _HAS_DND else tk.Tk
 
 
@@ -119,8 +114,8 @@ class App(_AppBase):
         self.cfg = load_config()
 
         self.title(APP_NAME)
-        self.geometry('960x860')
-        self.minsize(820, 640)
+        self.geometry('1280x860')
+        self.minsize(1024, 680)
 
         self.src_pdf_path = tk.StringVar()
         self.save_dir = tk.StringVar(value=self.cfg.get('last_dir', ''))
@@ -133,6 +128,7 @@ class App(_AppBase):
         self.ocr_info = tk.StringVar(value='')
         self.filter_text = tk.StringVar()
 
+        # 解析 / 匹配状态
         self.pages: list = []
         self.texts: list = []
         self._parsed_sig = None         # 已解析文件的签名，用于缓存失效判断
@@ -141,6 +137,17 @@ class App(_AppBase):
         self.matches: list = []
         self.busy = False
         self.parse_info = {'total': 0, 'empty_pages': 0, 'ocr_pages': 0, 'ocr_used': False}
+
+        # 预览 / 划线状态
+        self._pdoc = None               # 预览用的 PyMuPDF 文档（与解析独立）
+        self._preview_sig = None
+        self._page_no = 1               # 当前预览页（1 基）
+        self._photo = None              # 防 PhotoImage 被 GC
+        self._lines: dict = {}          # {1基页码: [0~1 分割线比例]}
+        self._line_mode = False
+        self._zoom_mode = tk.StringVar(value='适应宽度')
+        self._render_after = None
+        self.split_all_pages = tk.BooleanVar(value=False)
 
         self._q = queue.Queue()
         self._build_ui()
@@ -167,169 +174,407 @@ class App(_AppBase):
         style.configure('Treeview', font=(UI_FONT, 9), rowheight=24)
         style.configure('Treeview.Heading', font=(UI_FONT, 9, 'bold'))
         style.configure('TEntry', font=(UI_FONT, 10), padding=3)
-        style.configure('TCombobox', font=(UI_FONT, 10))
+        style.configure('TLabelframe.Label', font=(UI_FONT, 9, 'bold'))
 
         # 顶部标题条
-        head = tk.Frame(self, bg='#0f4c9e', height=54)
+        head = tk.Frame(self, bg='#0f4c9e', height=46)
         head.pack(fill='x')
         head.pack_propagate(False)
-        tk.Label(head, text=APP_NAME, font=(UI_FONT, 16, 'bold'),
+        tk.Label(head, text=APP_NAME, font=(UI_FONT, 14, 'bold'),
                  fg='white', bg='#0f4c9e').pack(side='left', padx=20)
-        tk.Label(head, text='按客户名称拆分回单', font=(UI_FONT, 9),
+        tk.Label(head, text='按客户拆分 · 划线拆分一页多单', font=(UI_FONT, 9),
                  fg='#bcd6f5', bg='#0f4c9e').pack(side='left')
 
-        body = ttk.Frame(self, padding=(16, 12, 16, 8))
+        # 主区：左功能区 + 右预览
+        body = tk.Frame(self)
         body.pack(fill='both', expand=True)
-        body.columnconfigure(0, weight=1)
+        self._build_sidebar(body)
+        self._build_preview(body)
 
-        # ── 源文件 ──
-        box1 = ttk.LabelFrame(body, text=' 1. 选择源 PDF ', padding=10)
+        # 底部状态栏
+        foot = ttk.Frame(self, padding=(10, 4, 10, 6))
+        foot.pack(fill='x')
+        self.progress = ttk.Progressbar(foot, mode='determinate', maximum=100, length=220)
+        self.progress.pack(side='left')
+        ttk.Label(foot, textvariable=self.status_text, foreground='#333')\
+            .pack(side='left', padx=(10, 0))
+
+    # ── 左侧功能区 ──────────────────────────────────────────────────────────
+
+    def _build_sidebar(self, parent):
+        side = ttk.Frame(parent, width=SIDE_W)
+        side.pack(side='left', fill='y', padx=(8, 4), pady=4)
+        side.pack_propagate(False)
+        side.columnconfigure(0, weight=1)
+
+        # 1. 源文件
+        box1 = ttk.LabelFrame(side, text=' 1. 选择源 PDF ', padding=8)
         box1.grid(row=0, column=0, sticky='ew')
         box1.columnconfigure(0, weight=1)
-
         ttk.Entry(box1, textvariable=self.src_pdf_path).grid(row=0, column=0, sticky='ew')
-        ttk.Button(box1, text='选择文件', width=10, command=self.select_pdf)\
-            .grid(row=0, column=1, padx=(8, 0))
-
+        ttk.Button(box1, text='选择文件', width=9, command=self.select_pdf)\
+            .grid(row=0, column=1, padx=(6, 0))
         self.drop_label = tk.Label(
-            box1, text='⬇  把 PDF 文件拖到这里（或拖到上方输入框）',
-            font=(UI_FONT, 9), fg='#5a6b7d', bg='#eef4fc',
-            relief='solid', borderwidth=1, pady=8)
-        self.drop_label.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(8, 0))
+            box1, text='⬇ 把 PDF 拖到这里', font=(UI_FONT, 9),
+            fg='#5a6b7d', bg='#eef4fc', relief='solid', borderwidth=1, pady=5)
+        self.drop_label.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(6, 0))
 
-        # ── 输出与匹配选项 ──
-        box2 = ttk.LabelFrame(body, text=' 2. 输出位置与匹配选项 ', padding=10)
-        box2.grid(row=1, column=0, sticky='ew', pady=(10, 0))
+        # 2. 解析与选项
+        box2 = ttk.LabelFrame(side, text=' 2. 解析回单 ', padding=8)
+        box2.grid(row=1, column=0, sticky='ew', pady=(8, 0))
         box2.columnconfigure(0, weight=1)
-
-        ttk.Entry(box2, textvariable=self.save_dir).grid(row=0, column=0, sticky='ew')
-        ttk.Button(box2, text='选择目录', width=10, command=self.select_dir)\
-            .grid(row=0, column=1, padx=(8, 0))
-
+        row = ttk.Frame(box2)
+        row.grid(row=0, column=0, sticky='ew')
+        self.btn_parse = ttk.Button(row, text='① 解析回单', width=11, command=self.do_parse)
+        self.btn_parse.pack(side='left')
+        ttk.Checkbutton(row, text='扫描件启用 OCR', variable=self.ocr_enabled).pack(side='left', padx=(10, 0))
+        self.ocr_label = ttk.Label(box2, textvariable=self.ocr_info,
+                                   foreground='#999', font=(UI_FONT, 8))
+        self.ocr_label.grid(row=1, column=0, sticky='w', pady=(2, 0))
         opts = ttk.Frame(box2)
-        opts.grid(row=1, column=0, columnspan=2, sticky='w', pady=(8, 0))
-        ttk.Checkbutton(opts, text='宽松匹配（忽略括号内容）', variable=self.loose_match,
+        opts.grid(row=2, column=0, sticky='w', pady=(4, 0))
+        ttk.Checkbutton(opts, text='宽松匹配', variable=self.loose_match,
                         command=self._on_match_option_changed).pack(side='left')
-        ttk.Checkbutton(opts, text='不覆盖已存在文件（自动加序号）',
-                        variable=self.avoid_overwrite).pack(side='left', padx=(16, 0))
-        ttk.Checkbutton(opts, text='所有客户合并为一个 PDF', variable=self.merge_one).pack(side='left', padx=(16, 0))
+        ttk.Checkbutton(opts, text='合并导出', variable=self.merge_one).pack(side='left', padx=(10, 0))
 
-        opts2 = ttk.Frame(box2)
-        opts2.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(4, 0))
-        ttk.Checkbutton(opts2, text='扫描件启用 OCR（图片页自动识别，较慢）',
-                        variable=self.ocr_enabled).pack(side='left')
-        self.ocr_label = ttk.Label(opts2, textvariable=self.ocr_info, foreground='#999')
-        self.ocr_label.pack(side='left', padx=(12, 0))
-
-        # ── 客户名称 ──
-        box3 = ttk.LabelFrame(body, text=' 3. 指定客户名称或页码（如 第3页 / p5；多个用逗号/分号/顿号/换行分隔） ', padding=10)
-        box3.grid(row=2, column=0, sticky='ew', pady=(10, 0))
+        # 3. 客户名称
+        box3 = ttk.LabelFrame(side, text=' 3. 客户名称或页码（第3页/p5，可多个） ', padding=8)
+        box3.grid(row=2, column=0, sticky='ew', pady=(8, 0))
         box3.columnconfigure(0, weight=1)
+        qrow = ttk.Frame(box3)
+        qrow.grid(row=0, column=0, sticky='ew')
+        qrow.columnconfigure(0, weight=1)
+        ttk.Entry(qrow, textvariable=self.query_text).grid(row=0, column=0, sticky='ew')
+        self.btn_preview = ttk.Button(qrow, text='② 预览', width=7, command=self.do_preview)
+        self.btn_preview.grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Entry(box3, textvariable=self.query_text).grid(row=0, column=0, sticky='ew')
-        ttk.Button(box3, text='预览匹配', width=10, command=self.do_preview)\
-            .grid(row=0, column=1, padx=(8, 0))
-
-        # 候选客户区
         cand = ttk.Frame(box3)
-        cand.grid(row=1, column=0, columnspan=2, sticky='nsew', pady=(8, 0))
-        box3.rowconfigure(1, weight=1)
+        cand.grid(row=1, column=0, sticky='ew', pady=(6, 0))
         cand.columnconfigure(0, weight=1)
-
-        bar = ttk.Frame(cand)
-        bar.grid(row=0, column=0, columnspan=2, sticky='ew')
-        ttk.Label(bar, text='候选客户（解析后自动识别，可多选）：', foreground='#444')\
-            .pack(side='left')
-        self.cand_hint = ttk.Label(bar, text='尚未解析', foreground='#999')
-        self.cand_hint.pack(side='left', padx=(6, 0))
-        ttk.Entry(bar, textvariable=self.filter_text, width=16)\
-            .pack(side='right')
-        ttk.Label(bar, text='筛选：', foreground='#444').pack(side='right')
+        ch = ttk.Frame(cand)
+        ch.grid(row=0, column=0, sticky='ew')
+        ttk.Label(ch, text='候选客户：', foreground='#444').pack(side='left')
+        self.cand_hint = ttk.Label(ch, text='尚未解析', foreground='#999')
+        self.cand_hint.pack(side='left', padx=(4, 0))
+        ttk.Entry(ch, textvariable=self.filter_text, width=10).pack(side='right')
+        ttk.Label(ch, text='筛选:', foreground='#444').pack(side='right')
         self.filter_text.trace_add('write', lambda *_: self._refresh_candidates())
-
-        lf = ttk.Frame(cand)
-        lf.grid(row=1, column=0, columnspan=2, sticky='nsew', pady=(4, 0))
-        lf.columnconfigure(0, weight=1)
-        lf.rowconfigure(0, weight=1)
-
-        self.cand_list = tk.Listbox(lf, selectmode='extended', height=4,
-                                    font=(UI_FONT, 10), activestyle='none',
+        self.cand_list = tk.Listbox(cand, selectmode='extended', height=4,
+                                    font=(UI_FONT, 9), activestyle='none',
                                     exportselection=False,
                                     selectbackground='#cfe3fb', selectforeground='#123')
-        self.cand_list.grid(row=0, column=0, sticky='nsew')
-        csb = ttk.Scrollbar(lf, orient='vertical', command=self.cand_list.yview)
-        self.cand_list.configure(yscrollcommand=csb.set)
-        csb.grid(row=0, column=1, sticky='ns')
+        self.cand_list.grid(row=1, column=0, sticky='ew', pady=(2, 0))
         self.cand_list.bind('<Double-Button-1>', self._on_cand_double_click)
+        ttk.Button(cand, text='加入名称框', width=9, command=self._use_selected)\
+            .grid(row=2, column=0, sticky='w', pady=(3, 0))
 
-        btn_row = ttk.Frame(cand)
-        btn_row.grid(row=2, column=0, columnspan=2, sticky='w', pady=(6, 0))
-        ttk.Button(btn_row, text='加入名称框', width=12, command=self._use_selected)\
-            .pack(side='left')
-        ttk.Button(btn_row, text='全选', width=7, command=lambda: self.cand_list.select_set(0, 'end'))\
-            .pack(side='left', padx=(6, 0))
-        ttk.Button(btn_row, text='清除选择', width=9,
-                   command=lambda: self.cand_list.selection_clear(0, 'end'))\
-            .pack(side='left', padx=(6, 0))
-
-        # ── 预览 ──
-        box4 = ttk.LabelFrame(body, text=' 4. 匹配预览 ', padding=10)
-        box4.grid(row=3, column=0, sticky='nsew', pady=(10, 0))
+        # 4. 匹配结果
+        box4 = ttk.LabelFrame(side, text=' 4. 匹配预览 ', padding=8)
+        box4.grid(row=3, column=0, sticky='nsew', pady=(8, 0))
         box4.columnconfigure(0, weight=1)
         box4.rowconfigure(0, weight=1)
-        body.rowconfigure(3, weight=1)
+        side.rowconfigure(3, weight=1)
 
-        cols = ('page', 'query', 'party', 'date', 'amount', 'summary')
+        cols = ('page', 'query', 'party', 'date', 'amount')
         self.tree = ttk.Treeview(box4, columns=cols, show='headings', height=7)
         for cid, text, w, anchor in (
-            ('page', '页码', 70, 'center'),
-            ('query', '归属客户', 150, 'w'),
-            ('party', '命中主体', 210, 'w'),
-            ('date', '日期', 130, 'center'),
-            ('amount', '金额', 120, 'e'),
-            ('summary', '摘要', 170, 'w'),
+            ('page', '页码', 58, 'center'),
+            ('query', '归属', 96, 'w'),
+            ('party', '命中主体', 120, 'w'),
+            ('date', '日期', 82, 'center'),
+            ('amount', '金额', 76, 'e'),
         ):
             self.tree.heading(cid, text=text)
-            self.tree.column(cid, width=w, anchor=anchor, stretch=(cid in ('party', 'summary')))
+            self.tree.column(cid, width=w, anchor=anchor, stretch=(cid == 'party'))
         self.tree.grid(row=0, column=0, sticky='nsew')
-
         tsb = ttk.Scrollbar(box4, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=tsb.set)
         tsb.grid(row=0, column=1, sticky='ns')
-
         self.tree.bind('<Double-Button-1>', self._open_selected_page)
 
-        # ── 操作区 ──
-        act = ttk.Frame(body)
-        act.grid(row=4, column=0, sticky='ew', pady=(10, 0))
+        # 操作区
+        act = ttk.Frame(side)
+        act.grid(row=4, column=0, sticky='ew', pady=(8, 0))
+        act.columnconfigure(0, weight=1)
+        self.btn_export = ttk.Button(act, text='③ 导出客户 PDF', command=self.do_export)
+        self.btn_export.grid(row=0, column=0, sticky='ew')
+        r2 = ttk.Frame(act)
+        r2.grid(row=1, column=0, sticky='ew', pady=(4, 0))
+        ttk.Button(r2, text='导出清单', command=self.do_export_csv).pack(side='left', expand=True, fill='x')
+        ttk.Button(r2, text='打开目录', command=self._open_out_dir).pack(side='left', expand=True, fill='x', padx=(4, 0))
+        ttk.Button(r2, text='清空', width=6, command=self.do_clear).pack(side='left', padx=(4, 0))
 
-        self.btn_parse = ttk.Button(act, text='① 解析回单', width=13, command=self.do_parse)
-        self.btn_parse.pack(side='left')
-        self.btn_preview = ttk.Button(act, text='② 预览匹配', width=13, command=self.do_preview)
-        self.btn_preview.pack(side='left', padx=(8, 0))
-        self.btn_export = ttk.Button(act, text='③ 导出 PDF', width=13, command=self.do_export)
-        self.btn_export.pack(side='left', padx=(8, 0))
+    # ── 右侧预览区 ──────────────────────────────────────────────────────────
 
-        ttk.Button(act, text='导出清单', width=10, command=self.do_export_csv).pack(side='left', padx=(8, 0))
-        ttk.Button(act, text='打开目录', width=10, command=self._open_out_dir).pack(side='left', padx=(8, 0))
-        ttk.Button(act, text='清空', width=8, command=self.do_clear).pack(side='right')
+    def _build_preview(self, parent):
+        pane = ttk.Frame(parent)
+        pane.pack(side='left', fill='both', expand=True, padx=(4, 8), pady=4)
+        pane.rowconfigure(2, weight=1)
+        pane.columnconfigure(0, weight=1)
 
-        # ── 进度 / 状态 ──
-        foot = ttk.Frame(body)
-        foot.grid(row=5, column=0, sticky='ew', pady=(8, 0))
-        foot.columnconfigure(0, weight=1)
+        # 翻页 / 缩放
+        nav = ttk.Frame(pane)
+        nav.grid(row=0, column=0, sticky='ew')
+        ttk.Button(nav, text='◀ 上一页', width=9, command=lambda: self._step_page(-1)).pack(side='left')
+        self.page_label = ttk.Label(nav, text='－ / －', font=(UI_FONT, 10, 'bold'))
+        self.page_label.pack(side='left', expand=True)
+        ttk.Button(nav, text='下一页 ▶', width=9, command=lambda: self._step_page(1)).pack(side='left')
+        ttk.Combobox(nav, textvariable=self._zoom_mode, width=8, state='readonly',
+                     values=('适应宽度', '50%', '75%', '100%', '150%', '200%'))\
+            .pack(side='right')
 
-        self.progress = ttk.Progressbar(foot, mode='determinate', maximum=100)
-        self.progress.grid(row=0, column=0, sticky='ew')
-        ttk.Label(foot, textvariable=self.status_text, foreground='#333')\
-            .grid(row=1, column=0, sticky='w', pady=(4, 0))
+        # 划线工具条
+        tools = ttk.LabelFrame(pane, text=' 划线拆分（一页多张回单时，画出分割线） ', padding=6)
+        tools.grid(row=1, column=0, sticky='ew', pady=(6, 0))
+        self.btn_line_mode = ttk.Button(tools, text='✂ 划线模式', width=10,
+                                        command=self._toggle_line_mode)
+        self.btn_line_mode.pack(side='left')
+        ttk.Button(tools, text='撤销', width=5, command=self._undo_line).pack(side='left', padx=(4, 0))
+        ttk.Button(tools, text='清空本页', width=8, command=self._clear_lines).pack(side='left', padx=(4, 0))
+        ttk.Separator(tools, orient='vertical').pack(side='left', fill='y', padx=(8, 8))
+        ttk.Label(tools, text='均分:').pack(side='left')
+        for n in (2, 3, 4):
+            ttk.Button(tools, text=f'{n}份', width=4,
+                       command=lambda n=n: self._even_split(n)).pack(side='left', padx=(3, 0))
+        ttk.Button(tools, text='复制到所有页', command=self._copy_lines_to_all).pack(side='left', padx=(8, 0))
+        ttk.Checkbutton(tools, text='拆分时应用到所有页', variable=self.split_all_pages)\
+            .pack(side='left', padx=(8, 0))
+        self.btn_split = ttk.Button(tools, text='⚡ 拆分导出', command=self.do_split_export)
+        self.btn_split.pack(side='right')
+        self.line_hint = ttk.Label(tools, text='', foreground='#666', font=(UI_FONT, 8))
+        self.line_hint.pack(side='right', padx=(0, 8))
 
-    def _setup_dnd(self):
-        for widget in (self.drop_label,):
-            widget.drop_target_register('DND_Files')
-            widget.dnd_bind('<<Drop>>', self._on_drop)
-            widget.dnd_bind('<<DragEnter>>', self._on_drag_enter)
-            widget.dnd_bind('<<DragLeave>>', self._on_drag_leave)
+        # 画布
+        cf = ttk.Frame(pane)
+        cf.grid(row=2, column=0, sticky='nsew', pady=(6, 0))
+        cf.rowconfigure(0, weight=1)
+        cf.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(cf, bg='#3a3f44', highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky='nsew')
+        vsb = ttk.Scrollbar(cf, orient='vertical', command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb = ttk.Scrollbar(cf, orient='horizontal', command=self.canvas.xview)
+        self.canvas.configure(xscrollcommand=hsb.set)
+        hsb.grid(row=1, column=0, sticky='ew')
+
+        self.canvas.bind('<Button-1>', self._on_canvas_click)
+        self.canvas.bind('<Button-3>', self._on_canvas_rightclick)
+        self.canvas.bind('<Configure>', self._on_canvas_resize)
+        self.canvas.bind('<Left>', lambda e: self._step_page(-1))
+        self.canvas.bind('<Right>', lambda e: self._step_page(1))
+
+    # ── PDF 预览 ────────────────────────────────────────────────────────────
+
+    def _page_count(self) -> int:
+        return self._pdoc.page_count if self._pdoc else 0
+
+    def _step_page(self, delta):
+        if not self._pdoc:
+            return
+        self._show_page(self._page_no + delta)
+
+    def _show_page(self, pno: int):
+        # 文档在 _render_preview 中懒加载，这里不能依赖 _pdoc 是否存在
+        total = self._page_count()
+        self._page_no = max(1, min(total, pno)) if total > 0 else max(1, pno)
+        self._render_preview()
+
+    def _zoom_factor(self, page_w: float) -> float:
+        mode = self._zoom_mode.get()
+        if mode == '适应宽度':
+            cw = max(self.canvas.winfo_width(), 200) - 24
+            return max(0.05, cw / page_w)
+        try:
+            return max(0.05, int(mode.rstrip('%')) / 100.0)
+        except ValueError:
+            return 1.0
+
+    def _render_preview(self):
+        """渲染当前页到位图，并叠加当前页的分割线。"""
+        self._render_after = None
+        self.canvas.delete('all')
+        self._photo = None
+        path = self.src_pdf_path.get().strip()
+        if not path or not os.path.isfile(path):
+            self.page_label.config(text='－ / －')
+            self.canvas.create_text(400, 260, text='在左侧选择 / 拖入 PDF 后在此预览',
+                                    fill='#c8cdd2', font=(UI_FONT, 12))
+            self._update_line_hint()
+            return
+        try:
+            import pymupdf
+            sig = self._file_sig(path)
+            if self._pdoc is None or sig != self._preview_sig:
+                if self._pdoc:
+                    self._pdoc.close()
+                self._pdoc = pymupdf.open(path)
+                self._preview_sig = sig
+                self._page_no = 1
+            total = self._page_count()
+            if total == 0:
+                raise ValueError('PDF 不含页面')
+            self._page_no = max(1, min(total, self._page_no))
+            page = self._pdoc[self._page_no - 1]
+
+            z = self._zoom_factor(page.rect.width)
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z), alpha=False)
+            self._photo = tk.PhotoImage(data=pix.tobytes('ppm'))
+            w, h = pix.width, pix.height
+            self.canvas.create_image(0, 0, anchor='nw', image=self._photo)
+            self.canvas.configure(scrollregion=(0, 0, w, h + 8))
+
+            # 叠加分割线
+            for f in sorted(self._lines.get(self._page_no, [])):
+                y = f * h
+                self.canvas.create_line(0, y, w, y, fill=LINE_COLOR, width=2,
+                                        dash=(6, 3), tags='splitline')
+            self.page_label.config(text=f'第 {self._page_no} / {total} 页')
+        except Exception as ex:
+            self.page_label.config(text='－ / －')
+            self.canvas.create_text(400, 260, text=f'预览失败：{ex}',
+                                    fill='#ffb4b4', font=(UI_FONT, 11))
+            LOG.warning('预览失败: %s', ex)
+        self._update_line_hint()
+
+    def _on_canvas_resize(self, _e=None):
+        if self._zoom_mode.get() != '适应宽度' or not self._pdoc:
+            return
+        # 防抖：拖动窗口时避免连续重渲染
+        if self._render_after:
+            self.after_cancel(self._render_after)
+        self._render_after = self.after(150, self._render_preview)
+
+    def _update_line_hint(self):
+        n = len(self._lines.get(self._page_no, []))
+        self.line_hint.config(text=f'本页 {n} 条线' if n else '')
+
+    # ── 划线交互 ────────────────────────────────────────────────────────────
+
+    def _toggle_line_mode(self):
+        self._line_mode = not self._line_mode
+        self.btn_line_mode.config(text='✂ 划线中…' if self._line_mode else '✂ 划线模式')
+        self.canvas.config(cursor='crosshair' if self._line_mode else '')
+        self._set_status('划线模式：在预览图上单击添加分割线，右键点线删除；再点一次按钮退出'
+                         if self._line_mode else '已退出划线模式')
+
+    def _img_geometry(self) -> int:
+        """返回预览图在画布上的高度（0 表示无图）。"""
+        return self._photo.height() if self._photo else 0
+
+    def _on_canvas_click(self, e):
+        if not self._line_mode or not self._photo:
+            return
+        h = self._img_geometry()
+        f = self.canvas.canvasy(e.y) / h
+        if 0.0 < f < 1.0:
+            lines = self._lines.setdefault(self._page_no, [])
+            if not any(abs(f - x) < 0.004 for x in lines):
+                lines.append(f)
+                self._render_preview()
+
+    def _on_canvas_rightclick(self, e):
+        if not self._photo:
+            return
+        lines = self._lines.get(self._page_no, [])
+        if not lines:
+            return
+        h = self._img_geometry()
+        y = self.canvas.canvasy(e.y)
+        nearest = min(lines, key=lambda f: abs(f * h - y))
+        if abs(nearest * h - y) <= 8:
+            lines.remove(nearest)
+            if not lines:
+                self._lines.pop(self._page_no, None)
+            self._render_preview()
+
+    def _undo_line(self):
+        lines = self._lines.get(self._page_no, [])
+        if lines:
+            lines.pop()
+            if not lines:
+                self._lines.pop(self._page_no, None)
+            self._render_preview()
+
+    def _clear_lines(self):
+        if self._lines.pop(self._page_no, None) is not None:
+            self._render_preview()
+
+    def _even_split(self, n: int):
+        self._lines[self._page_no] = [i / n for i in range(1, n)]
+        self._render_preview()
+        self._set_status(f'第 {self._page_no} 页已均分为 {n} 份；可进入划线模式微调（右键删除后重画）')
+
+    def _copy_lines_to_all(self):
+        fracs = self._lines.get(self._page_no)
+        if not fracs:
+            messagebox.showinfo('提示', '请先在当前页添加分割线')
+            return
+        total = self._page_count()
+        for p in range(1, total + 1):
+            self._lines[p] = list(fracs)
+        self._set_status(f'已把 {len(fracs)} 条分割线复制到全部 {total} 页')
+        self._render_preview()
+
+    def do_split_export(self):
+        """按分割线把页面裁切导出为新 PDF。"""
+        if self.busy:
+            return
+        pdf_path = self.src_pdf_path.get().strip()
+        if not pdf_path or not os.path.isfile(pdf_path):
+            messagebox.showwarning('提示', '请先选择源 PDF 文件')
+            return
+        all_pages = bool(self.split_all_pages.get())
+        if all_pages:
+            cur = self._lines.get(self._page_no)
+            if not cur:
+                messagebox.showwarning('提示', '当前页还没有分割线，无法应用到所有页')
+                return
+            page_lines = {p: list(cur) for p in range(1, self._page_count() + 1)}
+        else:
+            page_lines = {p: fs for p, fs in self._lines.items() if fs}
+            if not page_lines:
+                messagebox.showwarning('提示', '请先在预览图上添加分割线（或点均分按钮）')
+                return
+
+        out_dir = self._output_dir()
+        if not out_dir:
+            messagebox.showwarning('提示', '请指定输出目录')
+            return
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as ex:
+            messagebox.showerror('错误', f'无法创建输出目录：\n{ex}')
+            return
+
+        base = rp.sanitize_filename(os.path.splitext(os.path.basename(pdf_path))[0], '回单')
+        if all_pages:
+            name = f'{base}__全文档拆分.pdf'
+        elif len(page_lines) == 1:
+            name = f'{base}__拆分_第{next(iter(page_lines))}页.pdf'
+        else:
+            pages = '、'.join(str(p) for p in sorted(page_lines))
+            name = f'{base}__拆分_第{pages}页.pdf'
+        target = os.path.join(out_dir, name)
+        overwrite = not bool(self.avoid_overwrite.get())
+
+        self._set_busy(True)
+        self._set_status('正在拆分导出…')
+
+        def work():
+            actual, seg = rp.split_pdf_by_lines(pdf_path, page_lines, target, overwrite=overwrite)
+            self._q.put(('exported_msg', f'拆分完成：{seg} 段已导出\n\n{actual}'))
+
+        self._run_async(work, keep_busy_until_msg=True)
+
+    def _on_split_done(self, msg):
+        self._set_busy(False)
+        first = msg.splitlines()[0]
+        self._set_status(f'✅ {first}')
+        target = msg.strip().splitlines()[-1]
+        LOG.info('划线拆分: %s', target)
+        if messagebox.askyesno('拆分完成', msg + '\n\n是否打开输出目录？'):
+            open_folder(os.path.dirname(target))
 
     # ── OCR ─────────────────────────────────────────────────────────────────
 
@@ -340,7 +585,7 @@ class App(_AppBase):
             if name:
                 self._q.put(('ocrinfo', (f'OCR：{desc} 可用', '#2e7d32')))
             else:
-                self._q.put(('ocrinfo', ('OCR：未安装（勾选后可 pip install rapidocr_onnxruntime 启用）',
+                self._q.put(('ocrinfo', ('OCR 未安装（pip install rapidocr_onnxruntime 启用）',
                                          '#b26a00')))
             LOG.info('OCR 探测: %s', name or 'none')
 
@@ -369,6 +614,8 @@ class App(_AppBase):
                     self._on_preview_ready(payload)
                 elif kind == 'exported':
                     self._on_export_done(payload)
+                elif kind == 'exported_msg':
+                    self._on_split_done(payload)
                 elif kind == 'busy':
                     self._set_busy(bool(payload))
                 elif kind == 'error':
@@ -378,8 +625,12 @@ class App(_AppBase):
             pass
         self.after(120, self._poll_queue)
 
-    def _run_async(self, fn):
-        """在后台线程执行 fn（fn 内部通过 self._q 汇报进度）。"""
+    def _run_async(self, fn, keep_busy_until_msg: bool = False):
+        """在后台线程执行 fn（fn 内部通过 self._q 汇报进度）。
+
+        keep_busy_until_msg=True 时（如拆分导出），完成后由对应消息处理器解除忙碌；
+        出错路径始终会通过 error 消息解除忙碌。
+        """
         def runner():
             try:
                 fn()
@@ -396,14 +647,15 @@ class App(_AppBase):
                 self._q.put(('error', f'发生未预期的错误：\n{ex}'))
                 LOG.error('后台任务异常\n%s', traceback.format_exc())
             finally:
-                self._q.put(('busy', False))
+                if not keep_busy_until_msg:
+                    self._q.put(('busy', False))
 
         threading.Thread(target=runner, daemon=True).start()
 
     def _set_busy(self, busy: bool):
         self.busy = busy
         state = 'disabled' if busy else 'normal'
-        for b in (self.btn_parse, self.btn_preview, self.btn_export):
+        for b in (self.btn_parse, self.btn_preview, self.btn_export, self.btn_split):
             b.configure(state=state)
         if not busy:
             self.progress['value'] = 0
@@ -426,6 +678,8 @@ class App(_AppBase):
             self._reset_parse_state()
         self._set_status(f'已选择：{os.path.basename(path)}　（请点「① 解析回单」）')
         LOG.info('选择源文件: %s', path)
+        self._lines = {}
+        self._show_page(1)
 
     def _reset_parse_state(self):
         self.pages = []
@@ -455,6 +709,12 @@ class App(_AppBase):
             self.save_dir.set(path)
             self.cfg['last_dir'] = path
             save_config(self.cfg)
+
+    def _setup_dnd(self):
+        self.drop_label.drop_target_register('DND_Files')
+        self.drop_label.dnd_bind('<<Drop>>', self._on_drop)
+        self.drop_label.dnd_bind('<<DragEnter>>', self._on_drag_enter)
+        self.drop_label.dnd_bind('<<DragLeave>>', self._on_drag_leave)
 
     def _on_drag_enter(self, e=None):
         self.drop_label.config(bg='#cfe3fb', fg='#0f4c9e')
@@ -546,7 +806,7 @@ class App(_AppBase):
                 messagebox.showwarning('OCR 未能识别', tip)
             else:
                 tip = ('该 PDF 的页面是扫描图片（没有文本层），无法直接读取客户名称。\n\n'
-                       '可勾选上方「扫描件启用 OCR」后重新解析；\n'
+                       '可勾选「扫描件启用 OCR」后重新解析；\n'
                        '首次使用需安装 OCR 引擎：pip install rapidocr_onnxruntime')
                 self._set_status(f'⚠ {len(self.pages)} 页均为扫描件，可勾选 OCR 后重新解析')
                 messagebox.showwarning('需要 OCR', tip)
@@ -591,14 +851,14 @@ class App(_AppBase):
     def _use_selected(self):
         sel = self._selected_candidates()
         if not sel:
-            messagebox.showinfo('提示', '请先在下方列表中选中客户（可按住 Ctrl / Shift 多选）')
+            messagebox.showinfo('提示', '请先在候选列表中选中客户（可按住 Ctrl / Shift 多选）')
             return
         existing = parse_queries(self.query_text.get())
         merged = existing + [s for s in sel if s not in existing]
         self.query_text.set('；'.join(merged))
-        self._set_status(f'已加入 {len(sel)} 个客户到名称框，点「② 预览匹配」查看结果')
+        self._set_status(f'已加入 {len(sel)} 个客户到名称框，点「② 预览」查看结果')
 
-    # ── 预览 ────────────────────────────────────────────────────────────────
+    # ── 预览匹配 ────────────────────────────────────────────────────────────
 
     def _ensure_parsed(self) -> bool:
         """确保使用当前文件的解析结果（避免用旧文件缓存做匹配/导出）。"""
@@ -617,7 +877,7 @@ class App(_AppBase):
             return
         queries = parse_queries(self.query_text.get())
         if not queries:
-            messagebox.showwarning('提示', '请输入或选择客户名称')
+            messagebox.showwarning('提示', '请输入客户名称或页码')
             return
 
         loose = bool(self.loose_match.get())
@@ -650,7 +910,7 @@ class App(_AppBase):
         self._clear_tree()
         if not results:
             self._set_busy(False)
-            self.tree.insert('', 'end', values=('—', '—', '没有匹配到任何页面', '—', '—', '—'))
+            self.tree.insert('', 'end', values=('—', '—', '没有匹配到任何页面', '—', '—'))
             self._set_status(f'未找到匹配：{"、".join(queries)}')
             return
 
@@ -662,7 +922,6 @@ class App(_AppBase):
                 party,
                 page.get('date') or '—',
                 page.get('amount') or '—',
-                (page.get('summary') or '—')[:24],
             ))
 
         pages_hit = len({i['page']['page_num'] for i in results})
@@ -672,10 +931,10 @@ class App(_AppBase):
         detail = '，'.join(f'{k} {v} 页' for k, v in counts.items())
         missing = [q for q in queries if q not in counts]
         tip = f'（未命中：{"、".join(missing)}）' if missing else ''
-        if missing and any(rp.parse_page_token(q) is not None for q in missing):
-            tip += f'（页码超出范围 1~{len(self.pages)}）' if any(
-                rp.parse_page_token(q) is not None and not 1 <= rp.parse_page_token(q) <= len(self.pages)
-                for q in missing) else ''
+        if missing and any(
+                (n := rp.parse_page_token(q)) is not None and not 1 <= n <= len(self.pages)
+                for q in missing):
+            tip += f'（页码超出范围 1~{len(self.pages)}）'
         self._set_busy(False)
         self._set_status(f'匹配完成：命中 {pages_hit} 页　{detail}　{tip}（双击行可打开源文件）')
         LOG.info('预览: queries=%s hits=%s', queries, counts)
@@ -698,7 +957,8 @@ class App(_AppBase):
         pdf = self.src_pdf_path.get().strip()
         if not os.path.isfile(pdf):
             return
-        self._set_status(f'正在打开源文件…（请在阅读器中跳转到第 {page_no} 页）')
+        self._show_page(page_no)
+        self._set_status(f'预览已跳转到第 {page_no} 页')
         try:
             if os.name == 'nt':
                 os.startfile(pdf)  # noqa: S606
@@ -721,7 +981,7 @@ class App(_AppBase):
         if self.busy or not self._ensure_parsed():
             return
         if not self.matches:
-            messagebox.showinfo('提示', '请先点「② 预览匹配」确认要导出的页面')
+            messagebox.showinfo('提示', '请先点「② 预览」确认要导出的页面')
             return
         out_dir = self._output_dir()
         if not out_dir:
@@ -806,7 +1066,7 @@ class App(_AppBase):
 
     def do_export_csv(self):
         if not self.matches:
-            messagebox.showinfo('提示', '请先点「② 预览匹配」生成结果')
+            messagebox.showinfo('提示', '请先点「② 预览」生成结果')
             return
         path = filedialog.asksaveasfilename(
             title='导出匹配清单', defaultextension='.csv',
@@ -846,11 +1106,18 @@ class App(_AppBase):
         self.query_text.set('')
         self.filter_text.set('')
         self._reset_parse_state()
+        self._lines = {}
+        self._page_no = 1
+        if self._pdoc:
+            self._pdoc.close()
+            self._pdoc = None
+            self._preview_sig = None
+        self._render_preview()
         self._set_status('已清空')
 
     def _on_match_option_changed(self):
         if self.matches:
-            self._set_status('匹配选项已改变，请重新点「② 预览匹配」')
+            self._set_status('匹配选项已改变，请重新点「② 预览」')
 
     def _set_status(self, msg: str):
         self.status_text.set(msg)
@@ -860,6 +1127,8 @@ class App(_AppBase):
         self.cfg['ocr_enabled'] = bool(self.ocr_enabled.get())
         save_config(self.cfg)
         LOG.info('退出')
+        if self._pdoc:
+            self._pdoc.close()
         self.destroy()
 
 

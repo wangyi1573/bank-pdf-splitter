@@ -686,3 +686,55 @@ def split_pdf(pdf_path: str, output_path: str, page_indices, overwrite: bool = T
         out.close()
         src.close()
     return target
+
+
+def split_pdf_by_lines(pdf_path: str, page_lines: dict, output_path: str,
+                       overwrite: bool = True):
+    """按分割线把页面纵向裁切为多个新页（用于一页打印多张回单的场景）。
+
+    page_lines : {1基页码: [0~1 之间的分割线比例列表]}，如 {1: [0.33, 0.66]}
+                 表示把第 1 页按 1/3 均分为 3 段。
+    返回 (实际写入路径, 拆分出的段数)。
+
+    实现：new_page + show_pdf_page(clip=…)，裁切保留原页面矢量与文本，
+    拆出的每一段仍是可搜索、可提取文本的完整 PDF 页。
+    """
+    import pymupdf
+
+    if not page_lines or not any(f for f in page_lines.values()):
+        raise ValueError('没有可用的分割线')
+
+    if not os.path.isabs(output_path):
+        output_path = os.path.abspath(output_path)
+    target = output_path if overwrite else unique_path(output_path)
+
+    src = pymupdf.open(pdf_path)
+    out = pymupdf.open()
+    segments = 0
+    try:
+        total = src.page_count
+        for pno1, fracs in sorted(page_lines.items()):
+            if not pno1 or pno1 > total or not fracs:
+                continue
+            rect = src[pno1 - 1].rect
+            ys = [0.0] + sorted(f for f in fracs if 0.0 < f < 1.0) + [1.0]
+            for i in range(len(ys) - 1):
+                top = ys[i] * rect.height
+                bottom = ys[i + 1] * rect.height
+                if bottom - top < 2:          # 忽略过窄的碎片
+                    continue
+                clip = pymupdf.Rect(rect.x0, rect.y0 + top, rect.x1, rect.y0 + bottom)
+                newpage = out.new_page(width=rect.width, height=bottom - top)
+                newpage.show_pdf_page(newpage.rect, src, pno1 - 1, clip=clip)
+                segments += 1
+        if segments == 0:
+            raise ValueError('未拆分出任何内容（分割线无效或页码越界）')
+        os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+        try:
+            out.save(target, garbage=3, deflate=True)
+        except Exception as ex:
+            raise IOError(f'写入失败（文件可能正被其他程序占用）：{ex}') from ex
+    finally:
+        out.close()
+        src.close()
+    return target, segments
