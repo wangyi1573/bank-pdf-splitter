@@ -530,6 +530,226 @@ def parse_pages(texts: list, progress=None, use_parallel: bool = True) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 位置解析兜底（标签与值空间分离的版式）
+# ─────────────────────────────────────────────────────────────────────────────
+# 部分银行回单的标签与值不是「户名：XXX」同行紧邻写法，而是：
+#   - 标签两字之间被拉开（「户 名」，在词提取里是两个独立词）
+#   - 值与标签同行但相距几十 pt，纯文本正则完全无法命中
+# 此时按词坐标解析：按 y 聚行 → 行内找标签（允许拆字）→ 取同行右侧为值。
+
+_POS_PARTY_LABELS = [
+    '客户名称', '客户全称', '账户名称', '对方户名', '户名',
+    '付款人名称', '付款人', '收款人名称', '收款人', '汇款人',
+]
+_POS_FIELD_LABELS = {
+    'date': ('交易日期', '日期'),
+    'amount': ('交易金额', '金额'),
+    'summary': ('摘要', '用途'),
+}
+_ROW_TOL = 3.5      # 同一行的 y 容差
+_LABEL_GAP = 26.0   # 拆字标签内部的最大间距
+_VALUE_GAP = 60.0   # 标签到值、值内部词间的最大间距
+_CJK_RE = re.compile(r'[\u4e00-\u9fa5]{1,6}')
+_NUM_RE = re.compile(r'^[\d*.,¥￥\-]+$')
+
+
+def _group_rows(words):
+    """把 pymupdf words（x0,y0,x1,y1,text,…）按 y 聚成行，行内按 x 排序。"""
+    rows = []
+    for w in sorted(words, key=lambda r: (r[1], r[0])):
+        x0, y0, x1, _y1, text = w[0], w[1], w[2], w[3], w[4]
+        if rows and abs(y0 - rows[-1]['y']) <= _ROW_TOL:
+            rows[-1]['items'].append((x0, x1, text))
+            n = len(rows[-1]['items'])
+            rows[-1]['y'] = (rows[-1]['y'] * (n - 1) + y0) / n
+        else:
+            rows.append({'y': y0, 'items': [(x0, x1, text)]})
+    for r in rows:
+        r['items'].sort(key=lambda t: t[0])
+    return rows
+
+
+def _match_label_at(items, i, label):
+    """尝试从 items[i] 起匹配拆字标签，成功返回 (消耗个数, 标签结束x1)。"""
+    got = ''
+    prev_x1 = None
+    for k in range(i, min(i + len(label), len(items))):
+        x0, x1, t = items[k]
+        core = t.strip().rstrip('：:')
+        # 剥离括号后缀，如「额（小写）」「户名(付款)」
+        core = re.sub(r'[（(][^）)]*[）)]?', '', core)
+        if not core:
+            return None
+        # 标签内部每个片段应为短中文，且与上一片段间距不大
+        if prev_x1 is not None and x0 - prev_x1 > _LABEL_GAP:
+            return None
+        if not _CJK_RE.fullmatch(core) and core not in label:
+            return None
+        got += core
+        prev_x1 = x1
+        if got == label:
+            return (k - i + 1, x1)
+        if not label.startswith(got):
+            return None
+    return None
+
+
+def _collect_value(items, j, stop_labels):
+    """从 items[j] 起收集值 token：间距小、非标签、非长数字。返回 (文本, 结束下标)。"""
+    parts = []
+    prev_x1 = None
+    k = j
+    while k < len(items):
+        x0, x1, t = items[k]
+        core = t.strip()
+        if not core or core in ('：', ':'):
+            if parts:
+                break
+            # 值前的独立冒号 token：跳过（不中断收集）
+            prev_x1 = x1
+            k += 1
+            continue
+        if any(core.rstrip('：:') == lb for lb in stop_labels):
+            break
+        if prev_x1 is not None and x0 - prev_x1 > _VALUE_GAP:
+            break
+        # 主体值不应是长数字串（那是账号）
+        if parts and _NUM_RE.fullmatch(core) and len(re.sub(r'\D', '', core)) >= 6:
+            break
+        parts.append(core)
+        prev_x1 = x1
+        k += 1
+    return ''.join(parts), k
+
+
+def positional_parse(words) -> dict:
+    """按词坐标解析分离式标签版式，返回与 parse_page_text 同构的 dict。"""
+    parties, fields = [], {'date': '', 'amount': '', 'summary': '', 'upper_amount': ''}
+    all_labels = set(_POS_PARTY_LABELS) | {lb for v in _POS_FIELD_LABELS.values() for lb in v}
+    try:
+        rows = _group_rows(words)
+    except Exception:
+        rows = []
+    for row in rows:
+        items = row['items']
+        i = 0
+        while i < len(items):
+            labels_by_len = sorted(all_labels, key=len, reverse=True)
+            matched = None  # (label, consumed, end_x, value, j2)
+            # 形态①：单 token「标签：值」（如「摘要：工程款」被合成一个词）
+            core = items[i][2].strip()
+            for label in labels_by_len:
+                for sep in ('：', ':'):
+                    if core.startswith(label + sep) and len(core) > len(label) + len(sep):
+                        matched = (label, 1, items[i][1],
+                                   core[len(label) + len(sep):].strip(), i + 1)
+                        break
+                if matched:
+                    break
+            # 形态②：拆字标签 + 同行右侧值（长标签优先，避免「户名」截胡「对方户名」）
+            if not matched:
+                for label in labels_by_len:
+                    m = _match_label_at(items, i, label)
+                    if m:
+                        consumed, end_x = m
+                        j = i + consumed
+                        if j < len(items) and items[j][0] - end_x <= _VALUE_GAP:
+                            value, j2 = _collect_value(items, j, all_labels)
+                        else:
+                            value, j2 = '', j
+                        matched = (label, consumed, end_x, value, j2)
+                        break
+            if not matched:
+                i += 1
+                continue
+            label, consumed, end_x, value, j2 = matched
+            if value:
+                if label in _POS_PARTY_LABELS:
+                    v = normalize_name(value)
+                    if len(v) >= 2 and not _NUM_RE.fullmatch(v):
+                        parties.append(v)
+                elif label in _POS_FIELD_LABELS['date']:
+                    fields['date'] = fields['date'] or extract_date(value)
+                elif label in _POS_FIELD_LABELS['amount']:
+                    if value and not any(ch.isdigit() for ch in value):
+                        # 纯中文 → 大写金额
+                        fields['upper_amount'] = fields['upper_amount'] or value
+                    else:
+                        fields['amount'] = fields['amount'] or (
+                            re.sub(r'[^\d.]', '', value.split('，')[0].split(',')[0]) or '')
+                elif label in _POS_FIELD_LABELS['summary']:
+                    fields['summary'] = fields['summary'] or value[:40]
+            elif label in _POS_FIELD_LABELS['amount'] or label in _POS_FIELD_LABELS['date']:
+                # 金额/日期的值可能距标签很远（本例 88pt），向前只找数字/日期型 token
+                px = end_x
+                for k2 in range(j, len(items)):
+                    x0, x1, t = items[k2]
+                    if x0 - px > 120:
+                        break
+                    c = t.strip().lstrip('¥￥')
+                    if re.fullmatch(r'[\d,，.\-/:]+', c):
+                        if label in _POS_FIELD_LABELS['amount']:
+                            fields['amount'] = fields['amount'] or re.sub(r'[^\d.]', '', c) or ''
+                        else:
+                            fields['date'] = fields['date'] or extract_date(c) or ''
+                        break
+                    px = x1
+            i = max(j2, i + 1)
+    parties = dedupe_keep_order(parties)
+    return {
+        'parties': parties,
+        'customer': parties[0] if parties else None,
+        'date': fields['date'],
+        'amount': fields['amount'],
+        'upper_amount': fields['upper_amount'],
+        'summary': fields['summary'],
+        'text_len': 0,
+        'is_text_page': True,
+    }
+
+
+def parse_document(pdf_path: str, ocr: bool = False, progress=None, status=None):
+    """提取 + 解析 + 位置兜底的一站式入口。
+
+    返回 (texts, pages, info)。info 在 build_texts 基础上追加：
+      positional_fixed  通过位置解析兜底救回的页数
+    """
+    texts, info = build_texts(pdf_path, ocr=ocr, progress=progress, status=status)
+    if status:
+        status(f'共 {info["total"]} 页，正在解析字段…')
+    pages = parse_pages(texts, progress=progress)
+
+    need = [i for i, p in enumerate(pages)
+            if not p['parties'] and (texts[i] or '').strip()]
+    info['positional_fixed'] = 0
+    if need:
+        if status:
+            status(f'{len(need)} 页常规解析无字段，尝试位置解析…')
+        import pymupdf
+        doc = pymupdf.open(pdf_path)
+        fixed = 0
+        try:
+            for i in need:
+                try:
+                    words = doc[i].get_text('words')
+                except Exception:
+                    continue
+                alt = positional_parse(words)
+                if alt['parties']:
+                    p = pages[i]
+                    p['parties'] = alt['parties']
+                    p['customer'] = alt['parties'][0]
+                    p['date'] = p['date'] or alt['date']
+                    p['amount'] = p['amount'] or alt['amount']
+                    p['summary'] = p['summary'] or alt['summary']
+                    fixed += 1
+        finally:
+            doc.close()
+        info['positional_fixed'] = fixed
+    return texts, pages, info
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 匹配
 # ─────────────────────────────────────────────────────────────────────────────
 

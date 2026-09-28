@@ -27,3 +27,5 @@ Thumbs.db
 *.pdf
 split_guitest.py
 page_token_guitest.py
+ui_real_masked.png
+realdata_screenshot.py

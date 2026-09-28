@@ -766,7 +766,7 @@ class App(_AppBase):
         self.progress['value'] = 0
 
         def work():
-            texts, info = rp.build_texts(
+            texts, pages, info = rp.parse_document(
                 pdf_path, ocr=use_ocr,
                 progress=lambda d, t: self._q.put(('progress', (d, t))),
                 status=lambda m: self._q.put(('status', m)))
@@ -777,10 +777,9 @@ class App(_AppBase):
                 if missed:
                     tip += f'（{missed} 页仍未识别，可能清晰度不足）'
                 self._q.put(('status', tip))
-            self._q.put(('status', f'共 {info["total"]} 页，正在解析字段…'))
-            pages = rp.parse_pages(
-                texts,
-                progress=lambda d, t: self._q.put(('progress', (d, t))))
+            if info.get('positional_fixed'):
+                self._q.put(('status',
+                             f'{info["positional_fixed"]} 页为分离式版式，已通过位置解析识别'))
             self._q.put(('parsed', (pdf_path, sig, texts, pages, info)))
 
         self._run_async(work)
