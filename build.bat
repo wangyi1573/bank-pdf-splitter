@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal
 
 echo ========================================
-echo   贵州银行PDF回单拆分工具 - 打包脚本
+echo   银行PDF回单拆分工具 - 打包脚本
 echo ========================================
 echo.
 
@@ -29,7 +29,7 @@ if errorlevel 1 (
 echo.
 echo [INFO] 开始打包...
 python -m PyInstaller ^
-  --name "贵州银行PDF回单拆分工具" ^
+  --name "银行PDF回单拆分工具" ^
   --onefile ^
   --windowed ^
   --clean ^
@@ -46,6 +46,6 @@ if errorlevel 1 (
 echo.
 echo ========================================
 echo   打包完成
-echo   输出: dist\贵州银行PDF回单拆分工具.exe
+echo   输出: dist\银行PDF回单拆分工具.exe
 echo ========================================
 pause

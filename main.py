@@ -1,21 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-贵州银行 PDF 回单拆分工具（GUI）
+银行 PDF 回单拆分工具（GUI）
 
-用法
-----
-    python main.py
-或直接运行打包后的 exe。
+用法：python main.py，或直接运行打包后的 exe。
 
-流程
-----
-1. 选择 / 拖入源 PDF
-2. 点「解析回单」→ 后台线程提取文本 + 解析字段（页数多时自动多进程）
-3. 在候选客户列表中选择（可多选），或在输入框中手动输入（多个用 , ； 、 空格 或换行分隔）
-4. 点「预览匹配」核对命中页面
-5. 点「导出 PDF」→ 每个客户生成一个 PDF，或合并为一个
-
-相对旧版的关键修复与增强，见代码内注释与 REVIEW 报告。
+流程：选择/拖入源 PDF → ① 解析回单 → 指定客户名称 → ② 预览匹配 → ③ 导出 PDF。
+详细设计见 SPEC.md 与代码内注释。
 """
 
 from __future__ import annotations
@@ -44,8 +34,8 @@ try:
 except ImportError:
     _HAS_DND = False
 
-APP_NAME = '贵州银行PDF回单拆分工具'
-APP_DIR = Path.home() / '.guizhou_bank_pdf_splitter'
+APP_NAME = '银行PDF回单拆分工具'
+APP_DIR = Path.home() / '.bank_pdf_splitter'
 CONFIG_PATH = APP_DIR / 'config.json'
 LOG_DIR = APP_DIR / 'logs'
 
@@ -61,7 +51,7 @@ UI_FONT = '微软雅黑'
 
 def setup_logging() -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger('gzbank')
+    logger = logging.getLogger('bank_pdf_splitter')
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
@@ -143,13 +133,12 @@ class App(_AppBase):
         self.ocr_info = tk.StringVar(value='')
         self.filter_text = tk.StringVar()
 
-        # 数据状态
-        self.pages: list = []            # 解析结果
-        self.texts: list = []            # 原始文本
-        self._parsed_sig = None          # 已解析文件的签名，用于缓存失效判断
-        self._candidates: list = []      # 全部候选名称
-        self._filtered: list = []        # 过滤后展示的名称
-        self.matches: list = []          # 预览命中的页面
+        self.pages: list = []
+        self.texts: list = []
+        self._parsed_sig = None         # 已解析文件的签名，用于缓存失效判断
+        self._candidates: list = []
+        self._filtered: list = []
+        self.matches: list = []
         self.busy = False
         self.parse_info = {'total': 0, 'empty_pages': 0, 'ocr_pages': 0, 'ocr_used': False}
 
@@ -371,8 +360,7 @@ class App(_AppBase):
                     self.progress['value'] = (done / total * 100) if total else 0
                 elif kind == 'ocrinfo':
                     msg, color = payload
-                    # 注意：ocr_label 绑定了 textvariable，config(text=...) 会被
-                    # 变量静默覆盖而失效，必须改变量本身
+                    # ocr_label 绑定了 textvariable，config(text=...) 会被变量覆盖，必须改变量本身
                     self.ocr_info.set(msg)
                     self.ocr_label.config(foreground=color)
                 elif kind == 'parsed':
@@ -433,7 +421,7 @@ class App(_AppBase):
         self.src_pdf_path.set(path)
         d = self.cfg.get('last_dir')
         self.save_dir.set(d if d else os.path.dirname(path))
-        # 换了文件 → 旧的解析结果必须失效，否则会用上一个 PDF 的页码去拆分
+        # 换了文件 → 旧解析结果必须失效，否则会用上一个 PDF 的页码拆分
         if self._parsed_sig and self._parsed_sig != self._file_sig(path):
             self._reset_parse_state()
         self._set_status(f'已选择：{os.path.basename(path)}　（请点「① 解析回单」）')
@@ -453,7 +441,7 @@ class App(_AppBase):
 
     def select_pdf(self):
         path = filedialog.askopenfilename(
-            title='选择贵州银行回单 PDF',
+            title='选择银行回单 PDF',
             filetypes=[('PDF 文件', '*.pdf'), ('所有文件', '*.*')])
         if path:
             self._set_source(path)
@@ -734,10 +722,8 @@ class App(_AppBase):
         overwrite = not bool(self.avoid_overwrite.get())
         merge = bool(self.merge_one.get())
 
-        # 按查询词分组。
-        # 注意：同一页可能同时属于多个被查询的客户（例如客户A付款给客户B，
-        # 该页既是A的回单也是B的回单）。财务场景下每个客户的 PDF 都应完整，
-        # 因此这里按「客户」各自成组、允许跨组重复；仅在同一客户内部去重。
+        # 按客户分组导出。同一页可能同时属于多个客户（A 付款给 B，
+        # 该页既是 A 的回单也是 B 的回单），因此允许跨组重复，仅组内去重。
         groups = {}
         for item in self.matches:
             groups.setdefault(item['query'], set()).add(item['page']['page_num'])
@@ -814,7 +800,7 @@ class App(_AppBase):
         if not path:
             return
         try:
-            # 用 utf-8-sig 保证 Excel 打开不乱码
+            # utf-8-sig 保证 Excel 打开不乱码
             with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                 w = csv.writer(f)
                 w.writerow(['页码', '归属客户', '命中主体', '日期', '金额', '摘要'])

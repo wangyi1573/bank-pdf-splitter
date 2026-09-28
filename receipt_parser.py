@@ -1,17 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-贵州银行 PDF 回单解析核心模块
+银行 PDF 回单解析核心模块。
 
-设计要点
---------
-1. 无 GUI 依赖，可独立单测 / 可被多进程池 pickle（工作函数均为模块级函数）。
-2. 一页回单提取 **多个主体名称**（客户名称 / 户名 / 付款人 / 收款人 / 汇款人 …），
-   而不是只取第一个 —— 一张回单同时出现付款方与收款方，只取一个会漏单。
-3. 名称统一归一化（NFKC 全角转半角、去所有空白、剥离首尾标点），匹配前双方都归一化。
-4. 匹配时对空白名称做显式短路，避免 "" in "任意字符串" 恒为 True 的经典陷阱。
-5. 文本提取优先使用 PyMuPDF（C 实现，比 pdfplumber 快一个数量级），
-   某页返回空文本时才回退到 pdfplumber，兼顾速度与版面兼容性。
-6. 页数达到阈值时启用多进程并行解析（正则属于 CPU 密集），阈值以下串行避免进程启动开销。
+- 无 GUI 依赖，可独立单测、可被多进程池 pickle
+- 一页提取全部主体名称（付款人 / 收款人 / 户名 …），避免目标客户是付款方时漏单
+- 名称归一化（NFKC、去空白、剥标点）后匹配，空值显式短路
+- 文本提取：PyMuPDF 为主，空文本页回退 pdfplumber
+- 页数达到阈值自动多进程并行
 """
 
 from __future__ import annotations
@@ -53,10 +48,7 @@ UPPER_AMOUNT_LABELS = ['大写金额', '金额大写', '大写']
 # 摘要字段
 SUMMARY_LABELS = ['用途', '摘要', '附言', '交易摘要', '备注', '业务种类', '款项用途']
 
-# 日期字段：日期与时间分两步取。
-# 说明：曾尝试用单个正则 `(日期)(?:\s+(时间))?` 一次抓取，但贪婪的 `\s*`
-# 会把日期与时间之间的空格吃掉、而外层分组又是可选的 —— 正则整体匹配已成功，
-# 引擎不会再回溯，导致时间永远抓不到。拆成两步可以彻底避开这个陷阱。
+# 日期与时间分两步取（合并成单个正则时可选分组会抑制回溯，导致时间丢失）
 _DATE_PART = re.compile(r'(\d{4}\s*[-/年.]\s*\d{1,2}\s*[-/月.]\s*\d{1,2})\s*(日)?')
 _TIME_AFTER = re.compile(r'\s{0,3}(\d{1,2}:\d{2}(?::\d{2})?)(?![\d:])')
 
@@ -134,20 +126,18 @@ def dedupe_keep_order(items) -> list:
 
 def _capture_by_labels(text: str, labels, min_len: int = 2, max_len: int = 60) -> list:
     """按标签提取字段值，支持两种写法：
-      ① 带分隔符：客户名称：贵州XX有限公司
-      ② 无分隔符但后接长账号：付款人 贵州XX有限公司 6222xxxxxxxx
+      ① 带分隔符：客户名称：XX有限公司
+      ② 无分隔符但后接长账号：付款人 XX有限公司 6222xxxxxxxx
     返回已清洗、已去重的值列表。
     """
     results = []
     for label in labels:
         esc = re.escape(label)
-        # ① 冒号写法
         pat_colon = re.compile(esc + r'\s*[：:]\s*([^\r\n：:]{' + str(min_len) + r',' + str(max_len) + r'})')
         for m in pat_colon.finditer(text):
             v = clean_captured(m.group(1))
             if len(v) >= min_len:
                 results.append(v)
-        # ② 无冒号、后接长账号
         pat_nocolon = re.compile(esc + r'[ \t]*([^ \t\r\n：:0-9]{' + str(min_len) + r',' + str(max_len) + r'})[ \t]*' + _ACCOUNT_RE)
         for m in pat_nocolon.finditer(text):
             v = clean_captured(m.group(1))
@@ -157,11 +147,7 @@ def _capture_by_labels(text: str, labels, min_len: int = 2, max_len: int = 60) -
 
 
 def extract_parties(text: str) -> list:
-    """提取该页所有主体名称（客户名称 / 户名 / 付款人 / 收款人 …）。
-
-    这是相对旧版的核心改进：旧版只返回第一个匹配到的名称，
-    当目标客户在回单中是「付款人」而正则先命中「收款人」时，会直接漏单。
-    """
+    """提取该页所有主体名称（客户名称 / 户名 / 付款人 / 收款人 …）。"""
     return _capture_by_labels(text, ALL_PARTY_LABELS)
 
 

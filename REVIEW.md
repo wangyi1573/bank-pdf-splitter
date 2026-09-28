@@ -1,4 +1,4 @@
-# 代码审核报告 —— 贵州银行 PDF 回单拆分工具
+# 代码审核报告 —— 银行 PDF 回单拆分工具
 
 > 审核对象：旧版 `main.py`（单文件，约 530 行）
 > 审核日期：2026-09-24
@@ -84,7 +84,7 @@ if customer_lower in c.lower() or c.lower() in customer_lower:
 |---|------|------|
 | 16 | 530 行单文件，解析逻辑与 GUI 耦合，无法单测 | 拆出 `receipt_parser.py`（纯逻辑、可多进程 pickle、可独立测试）+ `main.py`（纯 GUI） |
 | 17 | `load_customers` 里对同一 Label 连续 `config` 两次，第一次被覆盖 | 删除冗余 |
-| 18 | `traceback.print_exc()` 只进 stderr，GUI 用户永远看不到 | 统一进 `~/.guizhou_bank_pdf_splitter/logs/` 日志文件 |
+| 18 | `traceback.print_exc()` 只进 stderr，GUI 用户永远看不到 | 统一进 `~/.bank_pdf_splitter/logs/` 日志文件 |
 | 19 | 无配置持久化，每次都要重新选目录 | 记住上次输出目录 |
 | 20 | `build.bat` 打包了程序根本用不到的 `msyh.ttc` 字体资源 | 移除；改为 `--collect-all tkinterdnd2`（拖拽库需要自带二进制） |
 | 21 | 固定 800×680 不可缩放，低分屏显示不全 | 可缩放 + `minsize`，列宽自适应 |

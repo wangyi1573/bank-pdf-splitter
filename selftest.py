@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-贵州银行回单拆分工具 - 全链路自测
+银行回单拆分工具 - 全链路自测
 
 覆盖：
   A. 名称归一化与匹配规则（含「空串误匹配」BUG 回归）
@@ -99,7 +99,7 @@ def build_sample_pdf(path: str) -> bool:
             c.showPage()
         y = h - 45 * mm
         c.setFont(font_name, 15)
-        c.drawString(45 * mm, y, '贵州银行电子回单')
+        c.drawString(45 * mm, y, 'XX银行电子回单')
         c.setFont(font_name, 10)
         rows = [
             f'交易日期：{date}',
@@ -165,7 +165,7 @@ def test_normalize():
 # B / C. 单页提取
 # ─────────────────────────────────────────────────────────────────────────────
 
-SAMPLE_PAGE = """贵州银行电子回单
+SAMPLE_PAGE = """XX银行电子回单
 交易日期：2024-03-15 10:22:31
 付款人名称：贵州茅台酒业有限公司
 付款人账号：6222021234567890123
@@ -459,10 +459,10 @@ def test_parallel_actually_used():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    tmpdir = tempfile.mkdtemp(prefix='gzbank_selftest_')
+    tmpdir = tempfile.mkdtemp(prefix='bank_pdf_selftest_')
     outdir = os.path.join(tmpdir, 'out')
     os.makedirs(outdir, exist_ok=True)
-    pdf_path = os.path.join(tmpdir, '贵州银行回单_样本.pdf')
+    pdf_path = os.path.join(tmpdir, '银行回单_样本.pdf')
 
     print(f'\n临时目录: {tmpdir}')
     print(f'阈值 PARALLEL_THRESHOLD = {rp.PARALLEL_THRESHOLD}, MAX_WORKERS = {rp.MAX_WORKERS}')

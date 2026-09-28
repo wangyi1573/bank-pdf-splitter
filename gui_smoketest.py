@@ -64,8 +64,8 @@ def pump(app, cond, timeout=60.0, label=''):
 
 def main():
     # 造样本
-    tmp = tempfile.mkdtemp(prefix='gzbank_gui_')
-    sample = os.path.join(tmp, '贵州银行回单_样本.pdf')
+    tmp = tempfile.mkdtemp(prefix='bank_pdf_gui_')
+    sample = os.path.join(tmp, '银行回单_样本.pdf')
     outdir = os.path.join(tmp, 'out')
     os.makedirs(outdir, exist_ok=True)
 
