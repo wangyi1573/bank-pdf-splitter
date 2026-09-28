@@ -22,3 +22,8 @@ selftest_output/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 源 PDF / 本地测试脚本（不上传）
+*.pdf
+split_guitest.py
+page_token_guitest.py
